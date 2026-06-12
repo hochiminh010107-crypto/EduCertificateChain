@@ -2,24 +2,41 @@
 
 use soroban_sdk::{
     contract, contractimpl, contracttype,
-    Address, Env, String,
+    symbol_short, Address, Env, String, Vec,
 };
 
 #[contracttype]
 #[derive(Clone)]
+pub enum CertificateType {
+    Degree,
+    Diploma,
+    CourseCompletion,
+    ProfessionalLicense,
+    AchievementBadge,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct Certificate {
+    pub cert_id: u64,
+    pub student_wallet: Address,
     pub student_name: String,
+    pub institution_name: String,
     pub course_name: String,
+    pub cert_type: CertificateType,
     pub issue_date: u64,
+    pub expiration_date: u64,
+    pub metadata_uri: String,
     pub issuer: Address,
-    pub certificate_hash: String,
     pub revoked: bool,
 }
 
 #[contracttype]
 pub enum DataKey {
-    Certificate(u64),
     Admin,
+    Issuer(Address),
+    Certificate(u64),
+    StudentCertificates(Address),
 }
 
 #[contract]
@@ -27,28 +44,19 @@ pub struct EduCertificateChain;
 
 #[contractimpl]
 impl EduCertificateChain {
-
-    // Initialize contract with administrator
+    // Initialize contract
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("Contract already initialized");
+            panic!("Already initialized");
         }
 
         admin.require_auth();
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
-    // Issue a new certificate
-    pub fn issue_certificate(
-        env: Env,
-        cert_id: u64,
-        student_name: String,
-        course_name: String,
-        certificate_hash: String,
-    ) {
+    // Add issuer
+    pub fn add_issuer(env: Env, issuer: Address) {
         let admin: Address = env
             .storage()
             .instance()
@@ -57,48 +65,148 @@ impl EduCertificateChain {
 
         admin.require_auth();
 
-        if env.storage().persistent().has(&DataKey::Certificate(cert_id)) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Issuer(issuer.clone()), &true);
+
+        env.events().publish(
+            (symbol_short!("issuer"), symbol_short!("add")),
+            issuer,
+        );
+    }
+
+    // Remove issuer
+    pub fn remove_issuer(env: Env, issuer: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap();
+
+        admin.require_auth();
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Issuer(issuer.clone()));
+
+        env.events().publish(
+            (symbol_short!("issuer"), symbol_short!("remove")),
+            issuer,
+        );
+    }
+
+    // Check issuer
+    pub fn is_issuer(env: Env, issuer: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer))
+            .unwrap_or(false)
+    }
+
+    // Issue certificate
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_certificate(
+        env: Env,
+        cert_id: u64,
+        student_wallet: Address,
+        student_name: String,
+        institution_name: String,
+        course_name: String,
+        cert_type: CertificateType,
+        expiration_date: u64,
+        metadata_uri: String,
+        issuer: Address,
+    ) {
+        issuer.require_auth();
+
+        let authorized: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Issuer(issuer.clone()))
+            .unwrap_or(false);
+
+        if !authorized {
+            panic!("Unauthorized issuer");
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Certificate(cert_id))
+        {
             panic!("Certificate already exists");
         }
 
         let certificate = Certificate {
+            cert_id,
+            student_wallet: student_wallet.clone(),
             student_name,
+            institution_name,
             course_name,
+            cert_type,
             issue_date: env.ledger().timestamp(),
-            issuer: admin,
-            certificate_hash,
+            expiration_date,
+            metadata_uri,
+            issuer,
             revoked: false,
         };
 
         env.storage()
             .persistent()
             .set(&DataKey::Certificate(cert_id), &certificate);
+
+        let mut student_certs: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StudentCertificates(student_wallet.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        student_certs.push_back(cert_id);
+
+        env.storage()
+            .persistent()
+            .set(
+                &DataKey::StudentCertificates(student_wallet),
+                &student_certs,
+            );
+
+        env.events().publish(
+            (symbol_short!("cert"), symbol_short!("issue")),
+            cert_id,
+        );
     }
 
-    // Revoke an existing certificate
-    pub fn revoke_certificate(env: Env, cert_id: u64) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap();
+    // Revoke certificate
+    pub fn revoke_certificate(
+        env: Env,
+        cert_id: u64,
+        issuer: Address,
+    ) {
+        issuer.require_auth();
 
-        admin.require_auth();
-
-        let mut certificate: Certificate = env
+        let mut cert: Certificate = env
             .storage()
             .persistent()
             .get(&DataKey::Certificate(cert_id))
             .unwrap();
 
-        certificate.revoked = true;
+        if cert.issuer != issuer {
+            panic!("Not certificate issuer");
+        }
+
+        cert.revoked = true;
 
         env.storage()
             .persistent()
-            .set(&DataKey::Certificate(cert_id), &certificate);
+            .set(&DataKey::Certificate(cert_id), &cert);
+
+        env.events().publish(
+            (symbol_short!("cert"), symbol_short!("revoke")),
+            cert_id,
+        );
     }
 
-    // Retrieve certificate information
+    // Get certificate
     pub fn get_certificate(
         env: Env,
         cert_id: u64,
@@ -109,17 +217,40 @@ impl EduCertificateChain {
             .unwrap()
     }
 
-    // Verify certificate validity
+    // Get all certificates of a student
+    pub fn get_student_certificates(
+        env: Env,
+        student: Address,
+    ) -> Vec<u64> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::StudentCertificates(student))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    // Verify certificate
     pub fn verify_certificate(
         env: Env,
         cert_id: u64,
     ) -> bool {
-        let certificate: Certificate = env
+        let cert: Certificate = env
             .storage()
             .persistent()
             .get(&DataKey::Certificate(cert_id))
             .unwrap();
 
-        !certificate.revoked
+        let now = env.ledger().timestamp();
+
+        if cert.revoked {
+            return false;
+        }
+
+        if cert.expiration_date != 0
+            && now > cert.expiration_date
+        {
+            return false;
+        }
+
+        true
     }
 }
